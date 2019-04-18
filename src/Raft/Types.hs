@@ -11,17 +11,12 @@ import Data.Aeson (FromJSON, ToJSON)
 data NodeState = NodeState {
     currentTerm :: Term,
     votedFor :: NodeId,
-    rLog :: Log,
-    commitIndex :: LogIndex,
-    lastApplied :: LogIndex,
-    nextIndex :: HashMap NodeId LogIndex,
-    matchIndex :: HashMap NodeId LogIndex,
     rState :: RAFTState
 } deriving (Show)
 
 data RAFTState = FOLLOWER | LEADER | CANDIDATE deriving (Show, Generic, Eq)
 
-newtype Term = Term Int deriving (Show, Generic, Eq)
+newtype Term = Term Int deriving (Show, Generic, Eq, Ord)
 
 instance ToJSON Term
 instance FromJSON Term
@@ -41,7 +36,7 @@ newtype Log = Log [LogEntry] deriving (Show, Generic)
 instance ToJSON Log
 instance FromJSON Log
 
-newtype LogIndex = LogIndex Int deriving (Show, Generic, Eq)
+newtype LogIndex = LogIndex Int deriving (Show, Generic, Eq, Ord)
 
 instance ToJSON LogIndex
 instance FromJSON LogIndex

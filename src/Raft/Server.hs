@@ -4,10 +4,12 @@ import Raft.Types
 import Raft.Utils
 import Data.List
 import Data.HashMap.Strict (fromList, HashMap)
-import Control.Concurrent.MVar (newEmptyMVar, takeMVar, tryTakeMVar, putMVar)
+import Control.Concurrent.MVar (newEmptyMVar, newMVar, 
+                                takeMVar, tryTakeMVar,
+                                putMVar, tryPutMVar)
 import Control.Concurrent (forkIO, MVar, threadDelay)
 import Control.Monad.State.Lazy (runState, get, put, gets)
-import Control.Monad (mapM_)
+import Control.Monad (mapM_, mapM)
 import Control.Concurrent.Chan (newChan, readChan, writeChan, dupChan, Chan)
 import Control.Concurrent.Async (async, wait, race)
 import Data.Maybe (Maybe(..), isJust, fromJust)
@@ -19,35 +21,25 @@ import Data.Aeson (encode, eitherDecode)
 myState = NodeState {
     currentTerm = Term 0,
     votedFor = unVote,
-    rLog = initLog,
-    commitIndex = LogIndex 0,
-    lastApplied = LogIndex 0,
-    nextIndex = initMap nodeIds (LogIndex 1),
-    matchIndex = initMap nodeIds (LogIndex 0),
     rState = FOLLOWER
 }
 
 -- MVar lock for accessing myState
-nodeStateMVar :: IO (MVar ())
+nodeStateMVar :: IO (MVar NodeState)
 nodeStateMVar = newEmptyMVar
-
-getStateLock :: IO ()
-getStateLock = nodeStateMVar >>= takeMVar  >> return ()
-
-putStateLock :: IO ()
-putStateLock = nodeStateMVar >>= (\mvar -> putMVar mvar ())  >> return ()
-
-isFollower :: IO Bool
-isFollower = do
-  getStateLock
-  let isFlwr = fst (runState (gets rState) myState) == FOLLOWER
-  putStateLock
-  return isFlwr
-
 
 -- followerChan is set whenever you're supposed to be in FOLLOWER state
 followerChan :: IO (MVar ())
 followerChan = newEmptyMVar
+
+commitIndexMVar :: IO (MVar LogIndex)
+commitIndexMVar = newMVar $ LogIndex 0
+
+lastAppliedMVar :: IO (MVar LogIndex)
+lastAppliedMVar = newMVar $ LogIndex 0
+
+logMVar :: IO (MVar Log)
+logMVar = newMVar $ initLog
 
 ------------------------- Cluster Configuration -------------------------------
 nodesInCluster = 5
@@ -82,82 +74,90 @@ follow :: NodeId -> IO ()
 follow myNodeId = do
   threadDelay electionTimeout
   val <- followerChan >>= tryTakeMVar
-  case val of 
-    Nothing -> contest myNodeId
-    Just _ -> follow myNodeId
+  if isJust val then follow myNodeId else contest myNodeId
 
 
 ------------------------- CANDIDATE Implementation ----------------------------
 
 contest :: NodeId -> IO ()
 contest myNodeId = do
-  updateStateToCandidate -- [FIX!] - vote for self not unvote
+  curState <- nodeStateMVar >>= takeMVar
+  let newState = curState{currentTerm = nextTerm (currentTerm curState),
+           rState = CANDIDATE, votedFor = myNodeId}
+  nodeStateMVar >>= \mvar -> putMVar mvar newState
+  args <- getRequestVoteArgs newState
   voteCounter <- newChan :: IO (Chan Int)
-  args <- getRequestVoteArgs myNodeId
-  mapM_ (\nodeId -> async $ sendVoteRequestTo nodeId args voteCounter myNodeId) nodeIds
+  quitChans <- mapM (\_ -> newEmptyMVar) nodeIds
+  mapM_ (\(nodeId, chan) -> async $ do
+                      sendVoteRequestTo nodeId args voteCounter myNodeId chan quitChans)
+        (zip nodeIds quitChans)
   let majority = (div nodesInCluster 2) + 1
-  Right res <- race (threadDelay electionTimeout >> return Nothing) (collectVotes voteCounter 0 0)
+  Right res <- race (waitAndBroadcast quitChans) (collectVotes voteCounter 0 0)
   case res of
-    Nothing -> contestOrFollow myNodeId
-    Just count | count < 0 -> follow myNodeId
-               | count >= majority -> lead myNodeId
-               | otherwise -> contestOrFollow myNodeId
-  return ()
+    Nothing -> contestOrFollow myNodeId quitChans
+    Just count | count >= majority -> broadcast quitChans  () >> lead myNodeId
+               | otherwise -> contestOrFollow myNodeId quitChans
+  where 
+    getRequestVoteArgs st = do
+      log <- logMVar >>= takeMVar
+      return $ RequestVoteArgs (currentTerm st) myNodeId
+                               (getLastLogTerm log) (getLastLogIndex log)
+    
+    waitAndBroadcast quitChans = threadDelay electionTimeout >> broadcast quitChans ()
 
-updateStateToCandidate :: IO ()
-updateStateToCandidate = do
-  getStateLock
-  let (st, _) = runState get myState
-      newState = st {currentTerm = nextTerm (currentTerm st),
-                     rState = CANDIDATE, votedFor = unVote}
-  return (runState (put newState) myState)
-  putStateLock
-
-getRequestVoteArgs :: NodeId -> IO RequestVoteArgs
-getRequestVoteArgs myNodeId = do
-  getStateLock
-  let (st, _) = runState get myState
-      newState = st {currentTerm = nextTerm (currentTerm st),
-                     rState = CANDIDATE, votedFor = unVote}
-  putStateLock
-  return $ RequestVoteArgs (currentTerm st) myNodeId
-                         (getLastLogTerm $ rLog st)
-                         (getLastLogIndex $ rLog st)
-
-largeNegativeVal = -1000
-
-sendVoteRequestTo :: NodeId -> RequestVoteArgs ->Chan Int -> NodeId -> IO ()
-sendVoteRequestTo nodeId args voteCounter myNodeId = do
-  fol <- isFollower
-  if fol then
-    writeChan voteCounter largeNegativeVal
-  else
+sendVoteRequestTo :: NodeId -> RequestVoteArgs -> Chan Int -> NodeId -> MVar () -> [MVar ()] -> IO ()   
+sendVoteRequestTo nodeId args voteCounter myNodeId quitChan quitChans = 
     do
-      res <- send nodeId args
-      let response = if isJust res then 
-            eitherDecode (fromJust res) :: Either String RequestVoteResponse 
-            else 
-              Left "Request failed" 
-      case response of
-        Left err -> putStrLn err >> sendVoteRequestTo nodeId args voteCounter myNodeId
-        Right res -> return ()
+      q <- tryTakeMVar quitChan 
+      if isJust q then
+        writeChan voteCounter 0
+      else
+        do
+          res <- send nodeId args
+          let response = if isJust res then 
+                eitherDecode (fromJust res) :: Either String RequestVoteResponse 
+                else 
+                  Left "Request failed" 
+          case response of
+            Left err -> do
+              putStrLn err 
+              sendVoteRequestTo nodeId args voteCounter myNodeId quitChan quitChans
+            Right (RequestVoteResponse trm reply) 
+              | reply -> writeChan voteCounter 0
+              | otherwise -> do
+                  broadcast quitChans ()
+                  if trm > (term args) then updateToFollower trm else return ()
+                  followerChan >>= \mvar -> tryPutMVar mvar ()
+                  return ()
+
+updateToFollower :: Term -> IO ()
+updateToFollower trm = do
+  curState <- nodeStateMVar >>= takeMVar
+  let newState = curState{currentTerm = trm,
+           rState = FOLLOWER, votedFor = unVote}
+  nodeStateMVar >>= \mvar -> putMVar mvar newState
+
+
+broadcast :: [MVar a] -> a -> IO ()
+broadcast quitChans val = mapM_ (\chan -> tryPutMVar chan val) quitChans
 
 collectVotes :: Chan Int -> Int -> Int -> IO (Maybe Int)
 collectVotes voteCounter votesCounted votesReceived = 
-  if (votesCounted==nodesInCluster) || 
-     (votesReceived >= majority) ||
-     (votesReceived < 0) then
+  if (votesCounted==nodesInCluster) || (votesReceived >= majority) then
     return $ Just votesReceived
   else 
     do
       v <- readChan voteCounter
-      collectVotes voteCounter (votesCounted + 1) (votesReceived + 1)
+      collectVotes voteCounter (votesCounted + 1) (votesReceived + v)
   where majority = (div nodesInCluster 2) + 1
 
-contestOrFollow :: NodeId -> IO ()
-contestOrFollow myNodeId = do
-  threadDelay electionTimeout
-  isFollower >>= \fol -> if fol then follow myNodeId else contest myNodeId
+contestOrFollow :: NodeId -> [MVar ()] -> IO ()
+contestOrFollow myNodeId quitChans = do
+  toFollow <- followerChan >>= tryTakeMVar
+  if isJust toFollow then 
+    broadcast quitChans () >> follow myNodeId 
+  else 
+    threadDelay electionTimeout >> contest myNodeId
 
 ---------------------------- LEADER Implementation -------------------------------
 
