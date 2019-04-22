@@ -93,7 +93,8 @@ instance FromJSON AppendEntriesArgs
 
 data AppendEntriesResponse = AppendEntriesResponse {
   followerTerm :: Term,
-  success :: Bool
+  success :: Bool,
+  nextIndexToSend :: LogIndex
 } deriving (Show, Eq, Generic)
 
 instance ToJSON AppendEntriesResponse

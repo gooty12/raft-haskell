@@ -19,6 +19,9 @@ initMap nodeIds val = fromList [(k, val) | k <- nodeIds]
 nextTerm :: Term -> Term
 nextTerm (Term t) = Term (t+1)
 
+nextIndex :: LogIndex -> LogIndex
+nextIndex (LogIndex indx) = LogIndex $ indx+1
+
 getLastLogIndex :: Log -> LogIndex
 getLastLogIndex (Log ls) = LogIndex $ (length ls) - 1
 
@@ -29,5 +32,17 @@ getLastLogTerm arg@(Log ls) =
 
 getEntryAt :: Log -> LogIndex -> LogEntry
 getEntryAt (Log ls) (LogIndex indx) = ls !! indx
+
+getPrevIndex :: LogIndex -> LogIndex
+getPrevIndex (LogIndex indx) = LogIndex (indx - 1)
+
+getEntriesFrom :: LogIndex -> Log -> Log
+getEntriesFrom (LogIndex indx) (Log lg) = Log $ drop (indx-1) lg
+
+append :: Log -> Log -> Log
+append (Log lg1) (Log lg2) = Log $ lg1 ++ lg2
+
+deleteAfter :: LogIndex -> Log -> Log
+deleteAfter (LogIndex indx) (Log lg) = Log $ take (indx+1) lg 
 
 localHostName = "127.0.0.1"
