@@ -3,13 +3,14 @@ module Raft.Server where
 
 import Raft.Types
 import Raft.Utils
+import Raft.Network
 import Prelude hiding (lookup)
 import Data.List hiding (lookup, insert)
 import Data.Aeson (encode, eitherDecode)
 import Data.HashMap.Strict (fromList, HashMap, elems, lookup, insert)
 import Data.Maybe (Maybe(..), isJust, fromJust)
 import Data.Either (Either(..), fromRight, fromLeft)
-import qualified Data.ByteString.Lazy.Char8 as DB (ByteString, empty)
+import qualified Data.ByteString.Lazy as DB (ByteString, empty, null)
 import Control.Concurrent.MVar (newEmptyMVar, newMVar, 
                                 takeMVar, tryTakeMVar,
                                 putMVar, tryPutMVar)
@@ -18,7 +19,11 @@ import Control.Monad.State.Lazy (runState, get, put, gets)
 import Control.Monad (mapM_, mapM)
 import Control.Concurrent.Chan (newChan, readChan, writeChan, dupChan, Chan)
 import Control.Concurrent.Async (async, wait, race)
-
+import Network.Socket hiding (send, sendTo, recv, recvFrom)
+import Network.Socket.ByteString.Lazy
+import qualified Control.Exception as E
+import Control.Monad (unless, forever, void)
+import Control.Concurrent (forkFinally)
 
 
 
@@ -57,22 +62,88 @@ clusterConfig = fromList $ zip nodeIds nodesAddrs
 -- election timeout 120 milli secs = 120 * 1000 micro secs
 electionTimeout = 120000
 
+getNodeAddress :: NodeId -> Maybe NodeAddress
+getNodeAddress nodeId = lookup nodeId clusterConfig
+
+-------------------------- Networking ----------------------------------------
+
+maxBytesToRcv = 4096 -- 4KB
+maxOutstandingConnections = 30
+
+resolve host port hints  = do
+  addr:_ <- getAddrInfo (Just hints) (Just host) (Just port)
+  return addr
+
+sendToNode :: NodeId -> DB.ByteString -> IO (Maybe DB.ByteString)
+sendToNode nodeId args =
+  withSocketsDo $ do
+    let nodeAddress = getNodeAddress nodeId
+    if isJust nodeAddress then
+      do
+        let NodeAddress{..} = fromJust nodeAddress
+            hints = defaultHints { addrSocketType = Stream }
+        addr <- resolve hostName portName hints
+        E.bracket (open addr) close talk
+    else
+      do
+        putStrLn $ "Invalid nodeId : " ++ (show nodeId)
+        return Nothing
+  where
+    open addr = do
+        sock <- socket (addrFamily addr) (addrSocketType addr) (addrProtocol addr)
+        connect sock $ addrAddress addr
+        return sock
+    talk sock = do
+        sendAll sock args
+        msg <- recv sock maxBytesToRcv
+        if DB.null msg then
+          return Nothing
+        else
+          return $ Just DB.empty
+
+-- Opens conncection and starts processing messages
+startListening :: [Char] -> [Char] -> IO ()
+startListening host port = 
+  withSocketsDo $ do
+    let hints = defaultHints {
+                addrFlags = [AI_PASSIVE]
+              , addrSocketType = Stream
+              }
+    addr <- resolve host port hints
+    E.bracket (open addr) close loop
+  where
+    open addr = do
+        sock <- socket (addrFamily addr) (addrSocketType addr) (addrProtocol addr)
+        setSocketOption sock ReuseAddr 1
+        -- If the prefork technique is not used,
+        -- set CloseOnExec for the security reasons.
+        fd <- fdSocket sock
+        setCloseOnExecIfNeeded fd
+        bind sock (addrAddress addr)
+        listen sock maxOutstandingConnections
+        return sock
+    loop sock = forever $ do
+        (conn, peer) <- accept sock
+        void $ forkFinally (handleMsg conn) (\_ -> close conn)
+
+handleMsg conn = do
+  byteStringMsg <- recv conn maxBytesToRcv
+  let (Right msg) = eitherDecode byteStringMsg :: Either String Message
+  rplyMsg <- 
+    case msg of
+      MRequestVote args -> handleRequestVoteRPC args >>= \res -> return $ encode res
+      MAppendEntries args -> handleAppendEntriesRPC args >>= \res -> return $ encode res
+      MNewCommand args -> handleNewCommandRPC args >>= \res -> return $ encode res
+  sendAll conn rplyMsg
+
+------------------------- START ----------------------------------------------
+
 -- Once server is launched it starts listening to messages from outside (RPCs
 -- from fellow servers well as new commands from clients) and begins as a
 -- follower
 launchServer host port myNodeId = do
   forkIO (startListening host port) >> follow myNodeId
 
--- Opens conncection and starts processing messages
-startListening :: [Char] -> [Char] -> IO ()
-startListening host port = return ()
-
-
-------------------------- Networking layer ------------------------------------
-
-send :: NodeId -> DB.ByteString -> IO (Maybe DB.ByteString)
-send nodeId args = do
-  return $ Just DB.empty
 
 ------------------------- RPC/Request handlers --------------------------------
 
@@ -193,7 +264,7 @@ sendVoteRequestTo nodeId args voteCounter myNodeId quitChan quitChans =
         writeChan voteCounter 0
       else
         do
-          res <- send nodeId $ encode args
+          res <- sendToNode nodeId $ encode args
           let response = if isJust res then 
                 eitherDecode (fromJust res) :: Either String RequestVoteResponse 
                 else 
@@ -341,7 +412,7 @@ sendAHeartbeat nodeId args timeoutChan = do
     return Nothing
   else
     do
-      res <- send nodeId $ encode args
+      res <- sendToNode nodeId $ encode args
       if isJust res then 
         do
           let (Right response) = eitherDecode (fromJust res) :: Either String AppendEntriesResponse

@@ -43,6 +43,6 @@ append :: Log -> Log -> Log
 append (Log lg1) (Log lg2) = Log $ lg1 ++ lg2
 
 deleteAfter :: LogIndex -> Log -> Log
-deleteAfter (LogIndex indx) (Log lg) = Log $ take (indx+1) lg 
+deleteAfter (LogIndex indx) (Log lg) = Log $ take (indx+1) lg
 
 localHostName = "127.0.0.1"
