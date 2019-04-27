@@ -3,7 +3,6 @@ module Raft.Server where
 
 import Raft.Types
 import Raft.Utils
-import Raft.Network
 import Prelude hiding (lookup)
 import Data.List hiding (lookup, insert)
 import Data.Aeson (encode, eitherDecode)
@@ -24,6 +23,7 @@ import Network.Socket.ByteString.Lazy
 import qualified Control.Exception as E
 import Control.Monad (unless, forever, void)
 import Control.Concurrent (forkFinally)
+import System.Random (getStdGen, randomR)
 
 
 
@@ -52,7 +52,7 @@ logMVar :: IO (MVar Log)
 logMVar = newMVar $ initLog
 
 ------------------------- Cluster Configuration -------------------------------
-nodesInCluster = 5
+nodesInCluster = 3
 nodeIds = [NodeId i | i <- [1..nodesInCluster]]
 nodesAddrs = [NodeAddress localHostName (show $ 3000 + port) | port <- [1 .. nodesInCluster]]
 
@@ -121,9 +121,11 @@ startListening host port =
         setCloseOnExecIfNeeded fd
         bind sock (addrAddress addr)
         listen sock maxOutstandingConnections
+        putStrLn  "Ready to accept connections"
         return sock
     loop sock = forever $ do
         (conn, peer) <- accept sock
+        putStrLn $ "New request from : " ++ (show peer)
         void $ forkFinally (handleMsg conn) (\_ -> close conn)
 
 handleMsg conn = do
@@ -142,7 +144,10 @@ handleMsg conn = do
 -- from fellow servers well as new commands from clients) and begins as a
 -- follower
 launchServer host port myNodeId = do
-  forkIO (startListening host port) >> follow myNodeId
+  putStrLn "Starting off as a follower"
+  async $ follow myNodeId
+  async (startListening host port)
+  
 
 
 ------------------------- RPC/Request handlers --------------------------------
@@ -222,9 +227,14 @@ handleAppendEntriesRPC AppendEntriesArgs{..} = do
 ------------------------- FOLLOWER Implementation -----------------------------
 follow :: NodeId -> IO ()
 follow myNodeId = do
-  threadDelay electionTimeout
+  -- threadDelay electionTimeout
   val <- followerChan >>= tryTakeMVar
-  if isJust val then follow myNodeId else contest myNodeId
+  if isJust val then 
+    follow myNodeId
+  else
+    do
+      logMsg myNodeId "No heartbeats received from leader. I'm contesting ....."
+      contest myNodeId
 
 
 ------------------------- CANDIDATE Implementation ----------------------------

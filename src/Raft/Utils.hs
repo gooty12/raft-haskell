@@ -46,3 +46,7 @@ deleteAfter :: LogIndex -> Log -> Log
 deleteAfter (LogIndex indx) (Log lg) = Log $ take (indx+1) lg
 
 localHostName = "127.0.0.1"
+
+logMsg :: NodeId -> [Char] -> IO ()
+logMsg nodeId msg = do
+  putStrLn $ (show nodeId) ++ ": " ++ msg
